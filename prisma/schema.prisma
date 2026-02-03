@@ -1,0 +1,161 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  stripeConnection StripeConnection?
+  settings         UserSettings?
+  templates        EmailTemplate[]
+  subscription     Subscription?
+  invoices         Invoice[]
+  reminderEvents   ReminderEvent[]
+  oauthStates      OAuthState[]
+}
+
+model StripeConnection {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  stripeAccountId String    @unique
+  accessTokenEnc  String
+  refreshTokenEnc String?
+  scope           String?
+  tokenType       String?
+  livemode        Boolean
+  connectedAt     DateTime  @default(now())
+  revokedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UserSettings {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  businessName     String?
+  replyToEmail     String?
+  remindersEnabled Boolean @default(true)
+  timezone         String  @default("UTC")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model EmailTemplate {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  step    Int // 1,2,3
+  subject String
+  body    String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, step])
+}
+
+model Subscription {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  status               String // active, past_due, canceled, etc.
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+model Invoice {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  stripeInvoiceId  String
+  stripeCustomerId String?
+  customerName     String?
+  customerEmail    String?
+
+  currency         String
+  amountDue        BigInt // cents
+  hostedInvoiceUrl String?
+  status           String // open/paid/etc.
+  dueDate          DateTime?
+  paidAt           DateTime?
+
+  firstSeenOverdueAt DateTime?
+  reminderStep       Int       @default(0) // 0..3
+  lastReminderSentAt DateTime?
+  nextReminderDueAt  DateTime?
+  remindersPaused    Boolean   @default(false)
+
+  lastSyncedAt DateTime @default(now())
+
+  reminderEvents ReminderEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, stripeInvoiceId])
+  @@index([userId])
+  @@index([status])
+  @@index([dueDate])
+  @@index([nextReminderDueAt])
+}
+
+model ReminderEvent {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  stripeInvoiceId   String
+  step              Int
+  toEmail           String
+  subject           String
+  status            String // sent/failed/skipped
+  providerMessageId String?
+  error             String?
+  sentAt            DateTime @default(now())
+
+  @@index([userId, sentAt])
+  @@index([invoiceId])
+  @@index([stripeInvoiceId])
+}
+
+model OAuthState {
+  id         String    @id @default(uuid())
+  userId     String
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
