@@ -1,5 +1,6 @@
 import Link from "next/link";
 import prisma from "@/app/(database)/lib/prisma";
+import SubscribeButton from "./SubscribeButton";
 
 type SearchParams = {
   stripe?: string;
@@ -34,6 +35,23 @@ export default async function BillingPage(props: {
   });
 
   const isConnected = Boolean(stripeConnection?.stripeAccountId);
+
+  const subscription = await prisma.subscription.findUnique({
+    where: { userId },
+    select: {
+      status: true,
+      currentPeriodEnd: true,
+      cancelAtPeriodEnd: true,
+      stripeSubscriptionId: true,
+      stripeCustomerId: true,
+    },
+  });
+
+  const isReallyActive =
+    (subscription?.status === "active" ||
+      subscription?.status === "trialing") &&
+    Boolean(subscription?.stripeSubscriptionId) &&
+    Boolean(subscription?.stripeCustomerId);
 
   return (
     <div style={{ maxWidth: 720, margin: "40px auto", padding: 16 }}>
@@ -113,6 +131,51 @@ export default async function BillingPage(props: {
           </Link>
         </div>
       )}
+
+      <div style={{ marginTop: 16 }}>
+        <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+          Subscription
+        </h2>
+
+        {isReallyActive ? (
+          <div
+            style={{
+              padding: 12,
+              border: "1px solid #86efac",
+              background: "#f0fdf4",
+              borderRadius: 8,
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>✅ {subscription?.status}</div>
+
+            {subscription?.currentPeriodEnd && (
+              <div style={{ marginTop: 6, fontSize: 14 }}>
+                Renews on: {subscription.currentPeriodEnd.toISOString()}
+              </div>
+            )}
+
+            {subscription?.cancelAtPeriodEnd && (
+              <div style={{ marginTop: 6, fontSize: 14 }}>
+                Canceling at period end
+              </div>
+            )}
+          </div>
+        ) : (
+          <div
+            style={{
+              padding: 12,
+              border: "1px solid #e5e7eb",
+              borderRadius: 8,
+            }}
+          >
+            <div style={{ marginBottom: 10 }}>
+              Status: <b>{subscription?.status ?? "none"}</b>
+            </div>
+
+            <SubscribeButton />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
