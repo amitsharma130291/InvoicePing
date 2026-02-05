@@ -1,6 +1,6 @@
 import { schedules } from "@trigger.dev/sdk";
 import Stripe from "stripe";
-import prisma from "../app/(database)/lib/prisma";
+import { prisma } from "../app/(database)/lib/prisma";
 
 function addDays(date: Date, days: number) {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);

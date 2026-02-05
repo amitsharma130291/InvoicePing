@@ -1,13 +1,16 @@
 import "dotenv/config";
-import { PrismaClient } from "../app/generated/prisma/client";
+import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
-import type { Prisma } from "../app/generated/prisma/client";
+import { Pool } from "pg";
 
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const adapter = new PrismaPg({
-  connectionString: process.env.DATABASE_URL, // make sure this exists in .env
-});
+if (!DATABASE_URL) {
+  throw new Error("DATABASE_URL missing. Put it in .env (not .env.local).");
+}
 
+const pool = new Pool({ connectionString: DATABASE_URL });
+const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 /**
@@ -23,10 +26,16 @@ const prisma = new PrismaClient({ adapter });
 
 const DAYS = (n: number) => n * 24 * 60 * 60 * 1000;
 
-function computeNextReminderDueAt(firstSeenOverdueAt: Date, reminderStep: number) {
-  if (reminderStep <= 0) return new Date(firstSeenOverdueAt.getTime() + DAYS(3));
-  if (reminderStep === 1) return new Date(firstSeenOverdueAt.getTime() + DAYS(7));
-  if (reminderStep === 2) return new Date(firstSeenOverdueAt.getTime() + DAYS(14));
+function computeNextReminderDueAt(
+  firstSeenOverdueAt: Date,
+  reminderStep: number,
+) {
+  if (reminderStep <= 0)
+    return new Date(firstSeenOverdueAt.getTime() + DAYS(3));
+  if (reminderStep === 1)
+    return new Date(firstSeenOverdueAt.getTime() + DAYS(7));
+  if (reminderStep === 2)
+    return new Date(firstSeenOverdueAt.getTime() + DAYS(14));
   return null;
 }
 
@@ -43,7 +52,7 @@ function defaultTemplates(businessName: string) {
         `Hi {{customer_name}},\n\n` +
         `Just a quick nudge — your invoice is now overdue. You can pay here:\n{{hosted_invoice_url}}\n\n` +
         `If you’ve already taken care of it, please ignore this.\n\n` +
-        `Thanks,\n${businessName}\n\n---\n${TEMPLATE_VARS_HELP}\n`,
+        `Thanks,\n${businessName}\n\n`,
     },
     {
       step: 2,
@@ -52,7 +61,7 @@ function defaultTemplates(businessName: string) {
         `Hi {{customer_name}},\n\n` +
         `Following up on the overdue invoice. Here’s the payment link again:\n{{hosted_invoice_url}}\n\n` +
         `If there’s anything blocking payment, just reply and let us know.\n\n` +
-        `Thanks,\n${businessName}\n\n---\n${TEMPLATE_VARS_HELP}\n`,
+        `Thanks,\n${businessName}\n\n`,
     },
     {
       step: 3,
@@ -61,7 +70,7 @@ function defaultTemplates(businessName: string) {
         `Hi {{customer_name}},\n\n` +
         `This is a final reminder that the invoice is still unpaid. Please complete payment here:\n{{hosted_invoice_url}}\n\n` +
         `If payment has already been made, you can ignore this message.\n\n` +
-        `Regards,\n${businessName}\n\n---\n${TEMPLATE_VARS_HELP}\n`,
+        `Regards,\n${businessName}\n\n`,
     },
   ];
 }
@@ -85,20 +94,31 @@ async function seedDemoInvoices(userId: string) {
   // Overdue invoice first seen overdue 10 days ago (so step 2 is due at day 14)
   const overdueA_firstSeen = new Date(now.getTime() - DAYS(10));
   const overdueA_step = 1; // already sent step 1
-  const overdueA_next = computeNextReminderDueAt(overdueA_firstSeen, overdueA_step);
+  const overdueA_next = computeNextReminderDueAt(
+    overdueA_firstSeen,
+    overdueA_step,
+  );
 
   // Overdue invoice first seen overdue 4 days ago (step 1 due at day 3; already should have been sent, but seed shows it pending)
   const overdueB_firstSeen = new Date(now.getTime() - DAYS(4));
   const overdueB_step = 0; // none sent yet
-  const overdueB_next = computeNextReminderDueAt(overdueB_firstSeen, overdueB_step);
+  const overdueB_next = computeNextReminderDueAt(
+    overdueB_firstSeen,
+    overdueB_step,
+  );
 
   // Paid invoice (should not be queued)
   const paidAt = new Date(now.getTime() - DAYS(2));
 
   // Use deterministic Stripe IDs for idempotency
-  const invoices : Prisma.InvoiceUpsertArgs[] = [
+  const invoices: Prisma.InvoiceUpsertArgs[] = [
     {
-      where: { userId_stripeInvoiceId: { userId, stripeInvoiceId: "in_seed_overdue_001" } },
+      where: {
+        userId_stripeInvoiceId: {
+          userId,
+          stripeInvoiceId: "in_seed_overdue_001",
+        },
+      },
       update: {
         status: "open",
         currency: "usd",
@@ -136,7 +156,12 @@ async function seedDemoInvoices(userId: string) {
       },
     },
     {
-      where: { userId_stripeInvoiceId: { userId, stripeInvoiceId: "in_seed_overdue_002" } },
+      where: {
+        userId_stripeInvoiceId: {
+          userId,
+          stripeInvoiceId: "in_seed_overdue_002",
+        },
+      },
       update: {
         status: "open",
         currency: "usd",
@@ -174,7 +199,9 @@ async function seedDemoInvoices(userId: string) {
       },
     },
     {
-      where: { userId_stripeInvoiceId: { userId, stripeInvoiceId: "in_seed_paid_001" } },
+      where: {
+        userId_stripeInvoiceId: { userId, stripeInvoiceId: "in_seed_paid_001" },
+      },
       update: {
         status: "paid",
         currency: "usd",
@@ -213,37 +240,40 @@ async function seedDemoInvoices(userId: string) {
     },
   ];
 
-const createdInvoices = await Promise.all(invoices.map((inv) => prisma.invoice.upsert(inv)));
-  
-  // Add audit trail examples (ReminderEvent) for first overdue invoice if not present
-const overdueA = createdInvoices.find((i) => i.stripeInvoiceId === "in_seed_overdue_001");
-if (overdueA) {
-  // Check if the event already exists (idempotent without hardcoding id)
-  const existing = await prisma.reminderEvent.findFirst({
-    where: {
-      invoiceId: overdueA.id,
-      step: 1,
-      status: "sent",
-    },
-  });
+  const createdInvoices = await Promise.all(
+    invoices.map((inv) => prisma.invoice.upsert(inv)),
+  );
 
-  if (!existing) {
-    await prisma.reminderEvent.create({
-      data: {
-        userId,
+  // Add audit trail examples (ReminderEvent) for first overdue invoice if not present
+  const overdueA = createdInvoices.find(
+    (i) => i.stripeInvoiceId === "in_seed_overdue_001",
+  );
+  if (overdueA) {
+    // Check if the event already exists (idempotent without hardcoding id)
+    const existing = await prisma.reminderEvent.findFirst({
+      where: {
         invoiceId: overdueA.id,
-        stripeInvoiceId: overdueA.stripeInvoiceId,
         step: 1,
-        toEmail: overdueA.customerEmail ?? "unknown@example.com",
-        subject: "Quick reminder: invoice is overdue",
         status: "sent",
-        providerMessageId: "seed-msg-001",
-        error: null,
       },
     });
-  }
-}
 
+    if (!existing) {
+      await prisma.reminderEvent.create({
+        data: {
+          userId,
+          invoiceId: overdueA.id,
+          stripeInvoiceId: overdueA.stripeInvoiceId,
+          step: 1,
+          toEmail: overdueA.customerEmail ?? "unknown@example.com",
+          subject: "Quick reminder: invoice is overdue",
+          status: "sent",
+          providerMessageId: "seed-msg-001",
+          error: null,
+        },
+      });
+    }
+  }
 }
 
 async function main() {
@@ -259,6 +289,7 @@ async function main() {
     create: {
       email: demoEmail,
       name: "InvoicePing Demo Founder",
+      clerkUserId: "clerk_demo_founder",
     },
   });
 

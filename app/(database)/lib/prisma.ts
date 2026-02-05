@@ -1,30 +1,57 @@
 // app/(database)/lib/prisma.ts
-import { PrismaClient } from "@prisma/client";
-import { PrismaPg } from "@prisma/adapter-pg";
-import { Pool } from "pg";
+import type { PrismaClient as PrismaClientType } from "@prisma/client";
 
-const globalForPrisma = globalThis as unknown as {
-  prisma?: PrismaClient;
-};
+// (Optional but recommended for Trigger.dev local dev)
+// Ensures DATABASE_URL is available when running outside Next.js.
+import "dotenv/config";
 
-function makePrismaClient() {
-  const databaseUrl = process.env.DATABASE_URL;
+function createPrismaClient(): PrismaClientType {
+  // Load PrismaClient constructor (interop-safe)
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const prismaMod = require("@prisma/client") as any;
 
-  if (!databaseUrl || databaseUrl.trim().length === 0) {
-    throw new Error(
-      "DATABASE_URL is missing. Add it to .env.local and restart the dev server.",
-    );
+  const PrismaClientCtor =
+    prismaMod?.PrismaClient ??
+    prismaMod?.default?.PrismaClient ??
+    prismaMod?.default ??
+    prismaMod;
+
+  // Prisma 7: provide either adapter OR accelerateUrl :contentReference[oaicite:1]{index=1}
+  const accelerateUrl = process.env.PRISMA_ACCELERATE_URL;
+
+  if (accelerateUrl) {
+    return new PrismaClientCtor({
+      accelerateUrl,
+      log:
+        process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+    }) as PrismaClientType;
   }
 
-  // Create a pg pool and pass it to the Prisma adapter
-  const pool = new Pool({ connectionString: databaseUrl });
-  const adapter = new PrismaPg(pool);
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is missing. Add it to your environment.");
+  }
 
-  return new PrismaClient({ adapter });
+  // Postgres driver adapter
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { PrismaPg } = require("@prisma/adapter-pg") as any;
+
+  const adapter = new PrismaPg({ connectionString });
+
+  return new PrismaClientCtor({
+    adapter,
+    log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+  }) as PrismaClientType;
 }
 
-export const prisma = globalForPrisma.prisma ?? makePrismaClient();
+declare global {
+  // eslint-disable-next-line no-var
+  var prisma: PrismaClientType | undefined;
+}
 
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+export const prisma: PrismaClientType =
+  globalThis.prisma ?? createPrismaClient();
 
-export default prisma;
+if (process.env.NODE_ENV !== "production") {
+  globalThis.prisma = prisma;
+}

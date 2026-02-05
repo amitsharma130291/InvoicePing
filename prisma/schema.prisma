@@ -20,6 +20,7 @@ model User {
   invoices         Invoice[]
   reminderEvents   ReminderEvent[]
   oauthStates      OAuthState[]
+  clerkUserId      String            @unique
 }
 
 model StripeConnection {

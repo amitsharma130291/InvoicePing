@@ -2,12 +2,19 @@ import { schedules } from "@trigger.dev/sdk";
 import { prisma } from "../app/(database)/lib/prisma";
 
 /**
- * Day-7 Reminder Sending Engine
+ * Reminder Sending Engine (Day 7 + Day 8 gates)
  *
- * - Finds invoices where nextReminderDueAt <= now
- * - Sends step 1/2/3 emails using per-user templates
- * - Logs ReminderEvent (sent / failed / skipped)
- * - Advances reminderStep + nextReminderDueAt (day 3 / 7 / 14 from firstSeenOverdueAt)
+ * Gates:
+ * - UserSettings.remindersEnabled must be true (global pause/unpause)
+ * - Invoice.remindersPaused must be false (invoice-level pause)
+ * - Subscription must be active/trialing (and within currentPeriodEnd if set)
+ *
+ * Idempotency:
+ * - Uses a DB-unique constraint on (invoiceId, step) to "claim" a send before emailing.
+ * - If another run already claimed the same invoice+step, we skip (no crash, no double-send).
+ *
+ * Notes:
+ * - Re-check gates inside loop to avoid accidental sends if user pauses mid-run.
  */
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -20,9 +27,6 @@ function computeNextReminderDueAt(
   firstSeenOverdueAt: Date,
   reminderStepAfterSend: number,
 ) {
-  // reminderStep: 0 none sent, 1 sent, 2 sent, 3 sent
-  // After sending step N, reminderStep = N
-  // next due is fixed at day 3/7/14 after first overdue.
   if (reminderStepAfterSend <= 0) return addDays(firstSeenOverdueAt, 3);
   if (reminderStepAfterSend === 1) return addDays(firstSeenOverdueAt, 7);
   if (reminderStepAfterSend === 2) return addDays(firstSeenOverdueAt, 14);
@@ -30,7 +34,6 @@ function computeNextReminderDueAt(
 }
 
 function formatMoney(amountCents: bigint, currency: string) {
-  // Plain, dependency-free formatting (good enough for MVP)
   const cents = Number(amountCents);
   const value = isFinite(cents) ? cents / 100 : 0;
   const upper = (currency || "usd").toUpperCase();
@@ -40,11 +43,14 @@ function formatMoney(amountCents: bigint, currency: string) {
 type TemplateVars = Record<string, string>;
 
 function renderTemplate(input: string, vars: TemplateVars) {
-  // Replace {{var}} occurrences.
   return input.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, key) => {
     const k = String(key);
     return vars[k] ?? "";
   });
+}
+
+function isUniqueConstraintError(err: any) {
+  return err?.code === "P2002";
 }
 
 async function sendEmailWithResend(args: {
@@ -88,29 +94,43 @@ async function sendEmailWithResend(args: {
 
 export const sendInvoiceReminders = schedules.task({
   id: "send-invoice-reminders",
-  // Run every 10 minutes (fast enough for MVP)
+  // Keep your schedule (you can switch to "*/10 * * * *" if you truly want every 10 minutes)
   cron: "*/10 * * * *",
   run: async () => {
     const now = new Date();
 
-    // Day-7 gating: user settings + per-invoice pause
-    // (Day-8 you’ll add active subscription gating)
     const dueInvoices = await prisma.invoice.findMany({
       where: {
         nextReminderDueAt: { lte: now },
+
+        // ✅ invoice-level pause gate
         remindersPaused: false,
+
         reminderStep: { lt: 3 },
         status: "open",
         paidAt: null,
+
         user: {
           settings: {
+            // ✅ global pause/unpause gate
             is: { remindersEnabled: true },
+          },
+
+          // ✅ subscription gate
+          subscription: {
+            is: {
+              status: { in: ["active", "trialing"] },
+              OR: [
+                { currentPeriodEnd: null },
+                { currentPeriodEnd: { gt: now } },
+              ],
+            },
           },
         },
       },
       include: {
         user: {
-          include: { settings: true },
+          include: { settings: true, subscription: true },
         },
       },
       orderBy: { nextReminderDueAt: "asc" },
@@ -125,61 +145,56 @@ export const sendInvoiceReminders = schedules.task({
     for (const inv of dueInvoices) {
       processed += 1;
 
+      // ✅ runtime double-check gates (prevents edge-case accidental sends)
+      if (inv.remindersPaused) {
+        skipped += 1;
+        continue;
+      }
+
       const user = inv.user;
       const settings = user.settings;
+
+      if (!settings?.remindersEnabled) {
+        skipped += 1;
+        continue;
+      }
+
+      const sub = user.subscription;
+      const subOk =
+        !!sub &&
+        (sub.status === "active" || sub.status === "trialing") &&
+        (!sub.currentPeriodEnd || sub.currentPeriodEnd > now);
+
+      if (!subOk) {
+        skipped += 1;
+        continue;
+      }
 
       // Next step to send
       const nextStep = (inv.reminderStep ?? 0) + 1;
       if (nextStep < 1 || nextStep > 3) continue;
 
-      // Idempotency: do not send same step twice
-      const alreadySent = await prisma.reminderEvent.findFirst({
-        where: {
-          userId: user.id,
-          invoiceId: inv.id,
-          step: nextStep,
-          status: "sent",
-        },
-        select: { id: true },
-      });
-
-      if (alreadySent) {
-        // Advance scheduling defensively so it doesn't get stuck.
-        const firstOverdue = inv.firstSeenOverdueAt ?? inv.dueDate;
-        const rawNextDue = firstOverdue
-          ? computeNextReminderDueAt(firstOverdue, nextStep)
-          : null;
-        const nextDue = rawNextDue && rawNextDue < now ? now : rawNextDue;
-
-        await prisma.invoice.update({
-          where: { id: inv.id },
-          data: {
-            reminderStep: nextStep,
-            lastReminderSentAt: inv.lastReminderSentAt ?? now,
-            nextReminderDueAt: nextDue,
-          },
-        });
-
-        skipped += 1;
-        continue;
-      }
-
       const toEmail = (inv.customerEmail || "").trim();
       if (!toEmail) {
-        await prisma.reminderEvent.create({
-          data: {
-            userId: user.id,
-            invoiceId: inv.id,
-            stripeInvoiceId: inv.stripeInvoiceId,
-            step: nextStep,
-            toEmail: "",
-            subject: "",
-            status: "skipped",
-            error: "Missing customer email on invoice",
-          },
-        });
+        // No email => log + stop future retries
+        try {
+          await prisma.reminderEvent.create({
+            data: {
+              userId: user.id,
+              invoiceId: inv.id,
+              stripeInvoiceId: inv.stripeInvoiceId,
+              step: nextStep,
+              toEmail: "",
+              subject: "",
+              status: "skipped",
+              error: "Missing customer email on invoice",
+            },
+          });
+        } catch (err: any) {
+          // If another run already logged this step, ignore
+          if (!isUniqueConstraintError(err)) throw err;
+        }
 
-        // Stop trying for this invoice (prevents endless retries)
         await prisma.invoice.update({
           where: { id: inv.id },
           data: { nextReminderDueAt: null },
@@ -194,32 +209,35 @@ export const sendInvoiceReminders = schedules.task({
       });
 
       if (!template) {
-        await prisma.reminderEvent.create({
-          data: {
-            userId: user.id,
-            invoiceId: inv.id,
-            stripeInvoiceId: inv.stripeInvoiceId,
-            step: nextStep,
-            toEmail,
-            subject: "",
-            status: "failed",
-            error: `Missing EmailTemplate for step ${nextStep}`,
-          },
-        });
+        // Missing template => log failure (idempotent)
+        try {
+          await prisma.reminderEvent.create({
+            data: {
+              userId: user.id,
+              invoiceId: inv.id,
+              stripeInvoiceId: inv.stripeInvoiceId,
+              step: nextStep,
+              toEmail,
+              subject: "",
+              status: "failed",
+              error: `Missing EmailTemplate for step ${nextStep}`,
+            },
+          });
+        } catch (err: any) {
+          if (!isUniqueConstraintError(err)) throw err;
+        }
+
         failed += 1;
         continue;
       }
 
       const vars: TemplateVars = {
-        // Your seeded vars
         customer_name: inv.customerName ?? "there",
         customer_email: toEmail,
         amount_due: formatMoney(inv.amountDue, inv.currency),
         currency: (inv.currency || "usd").toUpperCase(),
         hosted_invoice_url: inv.hostedInvoiceUrl ?? "",
-
-        // Extra vars (safe for future templates)
-        business_name: settings?.businessName ?? "",
+        business_name: settings.businessName ?? "",
         due_date: inv.dueDate ? inv.dueDate.toISOString().slice(0, 10) : "",
       };
 
@@ -232,26 +250,57 @@ export const sendInvoiceReminders = schedules.task({
         : null;
       const nextDue = rawNextDue && rawNextDue < now ? now : rawNextDue;
 
+      /**
+       * ✅ Idempotency "claim" (atomic)
+       * Create the reminder event FIRST.
+       * If it already exists (unique invoiceId+step), another run owns it -> skip.
+       *
+       * IMPORTANT: This relies on a unique constraint on ReminderEvent(invoiceId, step)
+       * (you already have it in DB, based on the error you posted).
+       */
+      let claimEventId: string | null = null;
+      try {
+        const claim = await prisma.reminderEvent.create({
+          data: {
+            userId: user.id,
+            invoiceId: inv.id,
+            stripeInvoiceId: inv.stripeInvoiceId,
+            step: nextStep,
+            toEmail,
+            subject,
+            status: "sending", // temporary state
+            error: null,
+            providerMessageId: null,
+            sentAt: now,
+          },
+          select: { id: true },
+        });
+        claimEventId = claim.id;
+      } catch (err: any) {
+        if (isUniqueConstraintError(err)) {
+          // Another run already claimed/sent this step.
+          skipped += 1;
+          continue;
+        }
+        throw err;
+      }
+
       try {
         const resp = await sendEmailWithResend({
           to: toEmail,
           subject,
           text: body,
-          replyTo: settings?.replyToEmail ?? null,
+          replyTo: settings.replyToEmail ?? null,
         });
 
         await prisma.$transaction([
-          prisma.reminderEvent.create({
+          prisma.reminderEvent.update({
+            where: { id: claimEventId },
             data: {
-              userId: user.id,
-              invoiceId: inv.id,
-              stripeInvoiceId: inv.stripeInvoiceId,
-              step: nextStep,
-              toEmail,
-              subject,
               status: "sent",
               providerMessageId: resp.id ?? null,
               error: null,
+              sentAt: now,
             },
           }),
           prisma.invoice.update({
@@ -266,16 +315,13 @@ export const sendInvoiceReminders = schedules.task({
 
         sent += 1;
       } catch (err: any) {
-        await prisma.reminderEvent.create({
+        // Mark the claimed event as failed (do not create a new row -> avoids unique crash)
+        await prisma.reminderEvent.update({
+          where: { id: claimEventId },
           data: {
-            userId: user.id,
-            invoiceId: inv.id,
-            stripeInvoiceId: inv.stripeInvoiceId,
-            step: nextStep,
-            toEmail,
-            subject,
             status: "failed",
             error: String(err?.message ?? err),
+            sentAt: now,
           },
         });
 
