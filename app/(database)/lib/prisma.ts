@@ -1,39 +1,30 @@
-import prismaPkg from "@prisma/client";
-import { Pool } from "pg";
+// app/(database)/lib/prisma.ts
+import { PrismaClient } from "@prisma/client";
 import { PrismaPg } from "@prisma/adapter-pg";
-
-const { PrismaClient } = prismaPkg as unknown as { PrismaClient: any };
+import { Pool } from "pg";
 
 const globalForPrisma = globalThis as unknown as {
-  prisma: any | undefined;
+  prisma?: PrismaClient;
 };
 
-// IMPORTANT:
-// Use the SAME env var you already use for Postgres.
-// Common ones: POSTGRES_URL, DATABASE_URL, NEON_DATABASE_URL, SUPABASE_DATABASE_URL
-const connectionString =
-  process.env.POSTGRES_URL ||
-  process.env.DATABASE_URL ||
-  process.env.NEON_DATABASE_URL ||
-  process.env.SUPABASE_DATABASE_URL;
+function makePrismaClient() {
+  const databaseUrl = process.env.DATABASE_URL;
 
-if (!connectionString) {
-  throw new Error(
-    "Missing database connection string. Set POSTGRES_URL (preferred) or DATABASE_URL.",
-  );
+  if (!databaseUrl || databaseUrl.trim().length === 0) {
+    throw new Error(
+      "DATABASE_URL is missing. Add it to .env.local and restart the dev server.",
+    );
+  }
+
+  // Create a pg pool and pass it to the Prisma adapter
+  const pool = new Pool({ connectionString: databaseUrl });
+  const adapter = new PrismaPg(pool);
+
+  return new PrismaClient({ adapter });
 }
 
-const pool = new Pool({ connectionString });
-const adapter = new PrismaPg(pool);
-
-const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    adapter,
-    log: ["error"],
-  });
+export const prisma = globalForPrisma.prisma ?? makePrismaClient();
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
 export default prisma;
-export { prisma };
