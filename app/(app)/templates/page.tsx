@@ -4,6 +4,7 @@ import TemplatesEditor from "./templates-editor";
 
 export default async function TemplatesPage() {
   const { userId: clerkUserId } = await auth();
+  console.log("Clerk:", clerkUserId);
   if (!clerkUserId) return null;
 
   const user = await prisma.user.findUnique({

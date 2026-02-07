@@ -1,23 +1,30 @@
 import { PrismaClient } from "@prisma/client";
+import { PrismaNeon } from "@prisma/adapter-neon";
+import { neon, neonConfig } from "@neondatabase/serverless";
+import ws from "ws";
 
 declare global {
   // eslint-disable-next-line no-var
   var prisma: PrismaClient | undefined;
 }
 
-const accelerateUrl = process.env.PRISMA_ACCELERATE_URL;
+// Required in Node.js for Neon serverless driver
+neonConfig.webSocketConstructor = ws;
 
-if (!accelerateUrl) {
-  throw new Error("Missing PRISMA_ACCELERATE_URL in env");
-}
+// IMPORTANT: this must be a *postgresql://* Neon URL (unpooled preferred)
+const connectionString = process.env.DATABASE_URL;
+if (!connectionString) throw new Error("Missing DATABASE_URL");
+
+const sql = neon(connectionString);
+const adapter = new PrismaNeon(sql);
 
 export const prisma =
   globalThis.prisma ??
   new PrismaClient({
-    accelerateUrl,
+    adapter,
     log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
   });
 
-if (process.env.NODE_ENV !== "production") {
-  globalThis.prisma = prisma;
-}
+if (process.env.NODE_ENV !== "production") globalThis.prisma = prisma;
+
+export default prisma;
