@@ -137,11 +137,13 @@ model ReminderEvent {
   step              Int
   toEmail           String
   subject           String
-  status            String // sent/failed/skipped
+  status            String // sending/sent/failed/skipped
   providerMessageId String?
   error             String?
   sentAt            DateTime @default(now())
 
+  // ✅ DB-enforced idempotency for reminders
+  @@unique([invoiceId, step])
   @@index([userId, sentAt])
   @@index([invoiceId])
   @@index([stripeInvoiceId])
